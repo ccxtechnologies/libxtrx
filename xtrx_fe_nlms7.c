@@ -28,7 +28,7 @@
 #include <assert.h>
 #include <stdarg.h>
 
-#include "../liblms7002m/liblms7002m.h"
+#include "liblms7002m.h"
 
 #include "xtrx_api.h"
 
