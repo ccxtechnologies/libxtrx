@@ -17,7 +17,6 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
-#include "xtrx_fe.h"
 #include <xtrxll_api.h>
 #include <xtrxll_log.h>
 #include <xtrxll_mmcm.h>
@@ -28,19 +27,13 @@
 #include <assert.h>
 #include <stdarg.h>
 
-#include "liblms7002m.h"
-
 #include "xtrx_api.h"
+#include "xtrx_fe_nlms7.h"
+
 
 enum {
 	MIN_TX_RATE = 2100000, /* 2.1e6 Minimum samplerate supported by the XTRX hardware */
 };
-
-typedef struct xtrx_bparam
-{
-	bool set;
-	unsigned value;
-} xtrx_bparam_t;
 
 static void bparam_set_null(xtrx_bparam_t* p)
 {
@@ -53,6 +46,7 @@ static void bparam_set_val(xtrx_bparam_t* p, unsigned val)
 	p->value = val;
 }
 
+#if 0
 typedef struct xtrx_bparamu8
 {
 	bool set;
@@ -69,68 +63,8 @@ static void bparamu8_set_val(xtrx_bparam_t* p, unsigned val)
 	p->set = true;
 	p->value = val;
 }
+#endif
 
-struct xtrx_nfe_lms7
-{
-	struct xtrx_fe_obj base;
-
-	struct xtrxll_dev* lldev;
-	struct lms7_state lms_state;
-
-	double cgen_clk;
-
-	unsigned lmsnum;
-	unsigned refclock;
-	unsigned refclk_source;
-
-	bool rx_no_siso_map;
-	bool tx_no_siso_map;
-
-	bool tx_run_a;
-	bool tx_run_b;
-
-	bool rx_run_a;
-	bool rx_run_b;
-
-	bool rx_port_1;
-
-	uint8_t             rx_mmcm_div;
-	uint8_t             tx_mmcm_div;
-	uint8_t             rx_port_cfg;
-	uint8_t             tx_port_cfg;
-
-	bool                rx_lna_auto;
-	bool                tx_lna_auto;
-
-	unsigned rx_host_decim;
-	unsigned tx_host_inter;
-
-	unsigned            rxcgen_div;
-	unsigned            txcgen_div;
-	unsigned            rxtsp_div;     /* Div ratio at LML */
-	unsigned            rxtsp_decim;   /* Decimation in TSP */
-	unsigned            txtsp_div;
-	unsigned            txtsp_interp;  /* Interpolation in TSP */
-
-	unsigned            txant;
-	unsigned            rxant;
-
-	double              rx_lo;
-	double              tx_lo;
-
-	struct lml_map maprx;
-	struct lml_map maptx;
-
-	enum lml_mode lml_mode;
-	unsigned lml_txdiv;
-	unsigned lml_rxdiv;
-
-	xtrx_bparam_t tx_bw[2];
-	xtrx_bparam_t rx_bw[2];
-
-	xtrx_bparam_t tx_dsp[2];
-	xtrx_bparam_t rx_dsp[2];
-};
 
 enum xtrxll_lms7_pwr {
 	XTRXLL_LMS7_RESET_PIN = 1<<1,
@@ -207,15 +141,15 @@ static int _xtrx_set_lna_rx(struct xtrx_nfe_lms7 *dev, int band)
 
 static int _xtrx_set_lna_tx(struct xtrx_nfe_lms7 *dev, int band)
 {
-	XTRXLLS_LOG("LMSF", XTRXLL_INFO, "%s: Set TX band to %d\n",
-				xtrxll_get_name(dev->lldev), band);
+	XTRXLLS_LOG("LMSF", XTRXLL_INFO, "%s: Set TX band to %d (%c)\n",
+				xtrxll_get_name(dev->lldev), band, (band == 1) ? 'H' : 'W');
 
 	int res = lms7_trf_set_path(&dev->lms_state, band);
 	if (res)
 		return res;
 
 	dev->txant = (band == 1) ? 1 : 0;
-	return xtrxll_set_param(dev->lldev, XTRXLL_PARAM_SWITCH_TX_ANT, dev->rxant);
+	return xtrxll_set_param(dev->lldev, XTRXLL_PARAM_SWITCH_TX_ANT, dev->txant);
 }
 
 
@@ -251,6 +185,9 @@ static int _xtrx_signal_event(struct xtrx_nfe_lms7 *dev, enum sigtype t)
 					   (dev->rx_lo > 1500e6) ? RFE_LNAW : RFE_LNAL;
 			XTRXLLS_LOG("LMSF", XTRXLL_INFO, "%s: Auto RX band selection: %s\n",
 						xtrxll_get_name(dev->lldev), get_band_name(band));
+			res = lms7_mac_set(&dev->lms_state, LMS7_CH_AB);
+			if (res)
+				return res;
 			res = _xtrx_set_lna_rx(dev, band);
 		}
 		break;
@@ -258,8 +195,12 @@ static int _xtrx_signal_event(struct xtrx_nfe_lms7 *dev, enum sigtype t)
 	case XTRX_TX_LNA_CHANGED:
 		if (dev->tx_lna_auto) {
 			int band = (dev->tx_lo > 2200e6) ? 1 : 2;
-			XTRXLLS_LOG("LMSF", XTRXLL_INFO, "%s: Auto TX band selection: %d\n",
-						xtrxll_get_name(dev->lldev), band);
+			XTRXLLS_LOG("LMSF", XTRXLL_INFO, "%s: Auto TX band selection: %s\n",
+						xtrxll_get_name(dev->lldev),
+						band == 1 ? "H (Band1)" : "W (Band2)");
+			res = lms7_mac_set(&dev->lms_state, LMS7_CH_AB);
+			if (res)
+				return res;
 			res = _xtrx_set_lna_tx(dev, band);
 		}
 		break;
@@ -318,8 +259,9 @@ static int _xtrx_channel_to_lms7(unsigned xch, enum lms7_mac_mode* out)
 }
 
 int lms7nfe_init(struct xtrxll_dev* lldev,
-				unsigned flags,
-				struct xtrx_fe_obj** obj)
+				 unsigned flags,
+				 const char *fename,
+				 struct xtrx_fe_obj** obj)
 {
 	struct xtrx_nfe_lms7 *dev;
 	int lmscnt = 0;
@@ -346,7 +288,7 @@ int lms7nfe_init(struct xtrxll_dev* lldev,
 
 	usleep(10000);
 
-	res = xtrxll_set_param(dev->lldev, XTRXLL_PARAM_FE_CTRL, PWR_CTRL_BUSONLY);
+	res = xtrxll_set_param(dev->lldev, XTRXLL_PARAM_PWR_CTRL, PWR_CTRL_BUSONLY);
 	if (res) {
 		goto failed_lms7;
 	}
@@ -828,10 +770,10 @@ static bool _xtrx_run_params_stream_is_mimo(const struct xtrx_dd_chpar* stream)
 			!(stream->flags & XTRX_RSP_SISO_MODE));
 }
 
-static const struct lml_map _get_lml_portcfg(const struct xtrx_dd_chpar* par,
+const struct lml_map lms7nfe_get_lml_portcfg(const struct xtrx_dd_chpar* par,
 											 bool no_siso_map)
 {
-	static const struct lml_map diqarray[12] = {
+	static const struct lml_map diqarray[16] = {
 		// MIMO modes
 		{{ LML_BI, LML_AI, LML_BQ, LML_AQ }},
 		{{ LML_BQ, LML_AQ, LML_BI, LML_AI }},
@@ -842,11 +784,16 @@ static const struct lml_map _get_lml_portcfg(const struct xtrx_dd_chpar* par,
 		{{ LML_AQ, LML_AQ, LML_AI, LML_AI }},
 		{{ LML_BI, LML_BI, LML_BQ, LML_BQ }},
 		{{ LML_BQ, LML_BQ, LML_BI, LML_BI }},
-		// MIMO test modes
+		// MIMO test modes (swap IQ_B)
 		{{ LML_BQ, LML_AI, LML_BI, LML_AQ }},
 		{{ LML_BI, LML_AQ, LML_BQ, LML_AI }},
 		{{ LML_AQ, LML_BI, LML_AI, LML_BQ }},
 		{{ LML_AI, LML_BQ, LML_AQ, LML_BI }},
+		// MIMO test modes (swap IQ_A)
+		{{ LML_BI, LML_AQ, LML_BQ, LML_AI }},
+		{{ LML_BQ, LML_AI, LML_BI, LML_AQ }},
+		{{ LML_AI, LML_BQ, LML_AQ, LML_BI }},
+		{{ LML_AQ, LML_BI, LML_AI, LML_BQ }},
 	};
 
 	unsigned diqidx = 0;
@@ -860,6 +807,8 @@ static const struct lml_map _get_lml_portcfg(const struct xtrx_dd_chpar* par,
 		diqidx |= 4;
 	else if (par->flags & XTRX_RSP_SWAP_IQB)
 		diqidx |= 8;
+	else if (par->flags & XTRX_RSP_SWAP_IQA)
+		diqidx |= 12;
 
 	assert(diqidx < (sizeof(diqarray)/sizeof(diqarray[0])));
 	return diqarray[diqidx];
@@ -910,7 +859,7 @@ int lms7nfe_dd_configure(struct xtrx_nfe_lms7* dev,
 			return -EINVAL;
 		}
 		rx_lmschan = _corr_ch(rx_lmschan, params->rx.flags);
-		dev->maprx = _get_lml_portcfg(&params->rx, dev->rx_no_siso_map);
+		dev->maprx = lms7nfe_get_lml_portcfg(&params->rx, dev->rx_no_siso_map);
 
 		rxafen_a = rx_lmschan != LMS7_CH_B;
 		rxafen_b = rx_lmschan != LMS7_CH_A;
@@ -920,7 +869,7 @@ int lms7nfe_dd_configure(struct xtrx_nfe_lms7* dev,
 			return -EINVAL;
 		}
 		tx_lmschan = _corr_ch(tx_lmschan, params->tx.flags);
-		dev->maptx = _get_lml_portcfg(&params->tx, dev->tx_no_siso_map);
+		dev->maptx = lms7nfe_get_lml_portcfg(&params->tx, dev->tx_no_siso_map);
 
 		txafen_a = tx_lmschan != LMS7_CH_B;
 		txafen_b = tx_lmschan != LMS7_CH_A;
@@ -982,6 +931,8 @@ int lms7nfe_dd_configure(struct xtrx_nfe_lms7* dev,
 
 			unsigned tsf = (ich == 0) ? XTRX_RSP_TEST_SIGNAL_A : XTRX_RSP_TEST_SIGNAL_B;
 			if (params->rx.flags & tsf) {
+				XTRXLLS_LOG("LMSF", XTRXLL_INFO,"%s: RBB Applying test tone on %c\n",
+							xtrxll_get_name(dev->lldev), (ich == 0) ? 'A' : 'B');
 				res = lms7_rxtsp_tsg_tone(&dev->lms_state, false, false);
 				if (res)
 					return res;
@@ -1001,64 +952,7 @@ int lms7nfe_dd_configure(struct xtrx_nfe_lms7* dev,
 					return res;
 			}
 		}
-#if 0
-		if ((params->rx.flags & XTRX_RSP_TEST_SIGNAL_A) && (rx_lmschan & LMS7_CH_A)) {
-			res = lms7_mac_set(&dev->lms_state, LMS7_CH_A);
-			if (res)
-				return res;
-			res = lms7_rxtsp_tsg_tone(&dev->lms_state, false, false);
-			if (res)
-				return res;
-		}
-		if ((params->rx.flags & XTRX_RSP_TEST_SIGNAL_B) && (rx_lmschan & LMS7_CH_B)) {
-			res = lms7_mac_set(&dev->lms_state, LMS7_CH_A);
-			if (res)
-				return res;
-			res = lms7_rxtsp_tsg_tone(&dev->lms_state, false, false);
-			if (res)
-				return res;
-		}
 
-		// Restore requested BW
-		if (dev->rx_bw[0].set && (rx_lmschan & LMS7_CH_A)) {
-			XTRXLLS_LOG("LMSF", XTRXLL_INFO, "RBB: Restore BW[A]=%d\n", dev->rx_bw[0].value);
-			res = lms7_mac_set(&dev->lms_state, LMS7_CH_A);
-			if (res)
-				return res;
-			res = lms7_rbb_set_bandwidth(&dev->lms_state, dev->rx_bw[0].value);
-			if (res)
-				return res;
-		}
-		if (dev->rx_bw[1].set && (rx_lmschan & LMS7_CH_B)) {
-			XTRXLLS_LOG("LMSF", XTRXLL_INFO, "RBB: Restore BW[B]=%d\n", dev->rx_bw[1].value);
-			res = lms7_mac_set(&dev->lms_state, LMS7_CH_B);
-			if (res)
-				return res;
-			res = lms7_rbb_set_bandwidth(&dev->lms_state, dev->rx_bw[1].value);
-			if (res)
-				return res;
-		}
-
-		//Restore CMIX configuration
-		if (dev->rx_dsp[0].set && (rx_lmschan & LMS7_CH_A)) {
-			XTRXLLS_LOG("LMSF", XTRXLL_INFO, "RBB: Restore DSP[A]=%d\n", dev->rx_dsp[0].value);
-			res = lms7_mac_set(&dev->lms_state, LMS7_CH_A);
-			if (res)
-				return res;
-			res = lms7_rxtsp_cmix(&dev->lms_state, dev->rx_dsp[0].value);
-			if (res)
-				return res;
-		}
-		if (dev->rx_dsp[1].set && (rx_lmschan & LMS7_CH_B)) {
-			XTRXLLS_LOG("LMSF", XTRXLL_INFO, "RBB: Restore DSP[B]=%d\n", dev->rx_dsp[1].value);
-			res = lms7_mac_set(&dev->lms_state, LMS7_CH_B);
-			if (res)
-				return res;
-			res = lms7_rxtsp_cmix(&dev->lms_state, dev->rx_dsp[1].value);
-			if (res)
-				return res;
-		}
-#endif
 		dev->rx_run_a = rxafen_a;
 		dev->rx_run_b = rxafen_b;
 	}
@@ -1075,7 +969,7 @@ int lms7nfe_dd_configure(struct xtrx_nfe_lms7* dev,
 		res = lms7_trf_enable(&dev->lms_state, txafen_a, txafen_b);
 		if (res)
 			return res;
-#if 1
+
 		// Restore settings
 		for (ich = 0; ich < 2; ich++) {
 			enum lms7_mac_mode lch = (ich == 0) ? LMS7_CH_A : LMS7_CH_B;
@@ -1088,6 +982,8 @@ int lms7nfe_dd_configure(struct xtrx_nfe_lms7* dev,
 
 			unsigned tsf = (ich == 0) ? XTRX_RSP_TEST_SIGNAL_A : XTRX_RSP_TEST_SIGNAL_B;
 			if (params->tx.flags & tsf) {
+				XTRXLLS_LOG("LMSF", XTRXLL_INFO,"%s: TBB Applying test tone on %c\n",
+							xtrxll_get_name(dev->lldev), (ich == 0) ? 'A' : 'B');
 				res = lms7_txtsp_tsg_tone(&dev->lms_state, false, false);
 				if (res)
 					return res;
@@ -1107,77 +1003,10 @@ int lms7nfe_dd_configure(struct xtrx_nfe_lms7* dev,
 					return res;
 			}
 		}
-#endif
-#if 0
-		if ((params->tx.flags & XTRX_RSP_TEST_SIGNAL_A) && (tx_lmschan & LMS7_CH_A)) {
-			res = lms7_mac_set(&dev->lms_state, LMS7_CH_A);
-			if (res)
-				return res;
-			res = lms7_txtsp_tsg_tone(&dev->lms_state, false, false);
-			if (res)
-				return res;
-		}
-		if ((params->tx.flags & XTRX_RSP_TEST_SIGNAL_B) && (tx_lmschan & LMS7_CH_B)) {
-			res = lms7_mac_set(&dev->lms_state, LMS7_CH_A);
-			if (res)
-				return res;
-			res = lms7_txtsp_tsg_tone(&dev->lms_state, false, false);
-			if (res)
-				return res;
-		}
 
-		// Restore requested BW
-		if (dev->tx_bw[0].set && (tx_lmschan & LMS7_CH_A)) {
-			XTRXLLS_LOG("LMSF", XTRXLL_INFO, "TBB: Restore BW[A]=%d\n", dev->tx_bw[0].value);
-			res = lms7_mac_set(&dev->lms_state, LMS7_CH_A);
-			if (res)
-				return res;
-			res = lms7_tbb_set_bandwidth(&dev->lms_state, dev->tx_bw[0].value);
-			if (res)
-				return res;
-		}
-		if (dev->tx_bw[1].set && (tx_lmschan & LMS7_CH_B)) {
-			XTRXLLS_LOG("LMSF", XTRXLL_INFO, "TBB: Restore BW[B]=%d\n", dev->tx_bw[1].value);
-			res = lms7_mac_set(&dev->lms_state, LMS7_CH_B);
-			if (res)
-				return res;
-			res = lms7_tbb_set_bandwidth(&dev->lms_state, dev->tx_bw[1].value);
-			if (res)
-				return res;
-		}
-		//Restore CMIX configuration
-		if (dev->tx_dsp[0].set && (tx_lmschan & LMS7_CH_A)) {
-			XTRXLLS_LOG("LMSF", XTRXLL_INFO, "TBB: Restore DSP[A]=%d\n", dev->tx_dsp[0].value);
-			res = lms7_mac_set(&dev->lms_state, LMS7_CH_A);
-			if (res)
-				return res;
-			res = lms7_txtsp_cmix(&dev->lms_state, dev->tx_dsp[0].value);
-			if (res)
-				return res;
-		}
-		if (dev->tx_dsp[1].set && (tx_lmschan & LMS7_CH_B)) {
-			XTRXLLS_LOG("LMSF", XTRXLL_INFO, "TBB: Restore DSP[B]=%d\n", dev->tx_dsp[1].value);
-			res = lms7_mac_set(&dev->lms_state, LMS7_CH_B);
-			if (res)
-				return res;
-			res = lms7_txtsp_cmix(&dev->lms_state, dev->tx_dsp[1].value);
-			if (res)
-				return res;
-		}
-#endif
 		dev->tx_run_a = txafen_a;
 		dev->tx_run_b = txafen_b;
 	}
-
-#if 0
-	// Move away
-	res = lms7_dc_start(&dev->lms_state,
-						dev->rx_run_a, dev->rx_run_b,
-						dev->tx_run_a, dev->tx_run_b);
-	if (res)
-		return res;
-#endif
-
 
 	unsigned nlml_mode = dev->lml_mode;
 	if (params->nflags & XTRX_RUN_DIGLOOPBACK) {
@@ -1203,6 +1032,8 @@ int lms7nfe_dd_configure(struct xtrx_nfe_lms7* dev,
 		dev->lml_mode = nlml_mode;
 	}
 
+	XTRXLLS_LOG("LMSF", XTRXLL_INFO_LMS, "%s: configure done\n",
+			   xtrxll_get_name(dev->lldev));
 	return 0;
 }
 
@@ -1290,6 +1121,14 @@ int lms7nfe_bb_set_freq(struct xtrx_fe_obj* obj,
 			bparam_set_val(&dev->tx_dsp[0], pfreq);
 		if (ch & LMS7_CH_B)
 			bparam_set_val(&dev->tx_dsp[1], pfreq);
+
+		if (dev->tx_run_a || dev->tx_run_b) {
+			res = lms7_mac_set(&dev->lms_state, ch);
+			if (res)
+				return res;
+			res = lms7_txtsp_cmix(&dev->lms_state,
+								  ch == LMS7_CH_B ? dev->tx_dsp[1].value : dev->tx_dsp[0].value);
+		}
 	} else {
 		double rx_dac_freq = dev->cgen_clk / dev->rxcgen_div;
 		rel_freq = freq / rx_dac_freq;
@@ -1305,23 +1144,14 @@ int lms7nfe_bb_set_freq(struct xtrx_fe_obj* obj,
 			bparam_set_val(&dev->rx_dsp[0], pfreq);
 		if (ch & LMS7_CH_B)
 			bparam_set_val(&dev->rx_dsp[1], pfreq);
-	}
 
-	if (dev->tx_run_a || dev->tx_run_b) {
-		res = lms7_mac_set(&dev->lms_state, ch);
-		if (res)
-			return res;
-	}
-	if (type == XTRX_TUNE_BB_TX && (dev->tx_run_a || dev->tx_run_b)) {
-		if (ch & LMS7_CH_A)
-			res = lms7_txtsp_cmix(&dev->lms_state, dev->tx_dsp[0].value);
-		else if (ch & LMS7_CH_B)
-			res = lms7_txtsp_cmix(&dev->lms_state, dev->tx_dsp[1].value);
-	} else if (type == XTRX_TUNE_BB_RX && (dev->rx_run_a || dev->rx_run_b)) {
-		if (ch & LMS7_CH_A)
-			res = lms7_rxtsp_cmix(&dev->lms_state, dev->rx_dsp[0].value);
-		else if (ch & LMS7_CH_B)
-			res = lms7_rxtsp_cmix(&dev->lms_state, dev->rx_dsp[1].value);
+		if (dev->rx_run_a || dev->rx_run_b) {
+			res = lms7_mac_set(&dev->lms_state, ch);
+			if (res)
+				return res;
+			res = lms7_rxtsp_cmix(&dev->lms_state,
+								  ch == LMS7_CH_B ? dev->rx_dsp[1].value : dev->rx_dsp[0].value);
+		}
 	}
 	if (res)
 		return res;
@@ -1361,6 +1191,7 @@ int lms7nfe_bb_set_badwidth(struct xtrx_fe_obj* obj,
 		if (dir == XTRX_TUNE_BB_RX) {
 			bparam_set_val(&dev->rx_bw[(j == LMS7_CH_A) ? 0 : 1], bw);
 
+			///////////////// FIXMEEEEEEEEEE!!!!!!!!!!!!!!!!!!!!!!!!
 			res = lms7_rbb_set_path(&dev->lms_state, RBB_LBF);
 			if (res)
 				return res;
@@ -1482,53 +1313,38 @@ int lms7nfe_fe_set_freq(struct xtrx_fe_obj* obj,
 
 	res = lms7_sxx_tune_sync(&dev->lms_state, rx, (unsigned)freq,
 							 type == XTRX_TUNE_TX_AND_RX_TDD);
-	res_freq = freq;
-	if (res == 0) {
-		if (actualfreq)
-			*actualfreq = res_freq;
-
-		if (type == XTRX_TUNE_TX_AND_RX_TDD) {
-			dev->rx_lo = dev->tx_lo = res_freq;
-		} else {
-			if (!rx) {
-				dev->tx_lo = res_freq;
-			} else {
-				dev->rx_lo = res_freq;
-			}
-		}
-
-		if (type == XTRX_TUNE_TX_AND_RX_TDD || type == XTRX_TUNE_RX_FDD) {
-			enum lms7_mac_mode mode = (dev->rx_run_a && dev->rx_run_b) ? LMS7_CH_AB :
-									  (dev->rx_run_a) ? LMS7_CH_A :
-									  (dev->rx_run_b) ? LMS7_CH_B : LMS7_CH_NONE;
-			if (mode != LMS7_CH_NONE) {
-				res = lms7_mac_set(&dev->lms_state, mode);
-				if (res)
-					return res;
-
-				res = _xtrx_signal_event(dev, XTRX_RX_LO_CHANGED);
-				if (res)
-					return res;
-			}
-		}
-		if (type == XTRX_TUNE_TX_AND_RX_TDD || type == XTRX_TUNE_TX_FDD) {
-			enum lms7_mac_mode mode = (dev->tx_run_a && dev->tx_run_b) ? LMS7_CH_AB :
-									  (dev->tx_run_a) ? LMS7_CH_A :
-									  (dev->tx_run_b) ? LMS7_CH_B : LMS7_CH_NONE;
-			if (mode != LMS7_CH_NONE) {
-				res = lms7_mac_set(&dev->lms_state, mode);
-				if (res)
-					return res;
-
-				res = _xtrx_signal_event(dev, XTRX_TX_LO_CHANGED);
-				if (res)
-					return res;
-			}
-		}
-		return 0;
+	res_freq = freq; //TODO !!!!!
+	if (res) {
+		return res;
 	}
 
-	return res;
+	if (actualfreq)
+		*actualfreq = res_freq;
+
+	if (type == XTRX_TUNE_TX_AND_RX_TDD) {
+		dev->rx_lo = dev->tx_lo = res_freq;
+	} else {
+		if (!rx) {
+			dev->tx_lo = res_freq;
+		} else {
+			dev->rx_lo = res_freq;
+		}
+	}
+
+	if ((type == XTRX_TUNE_TX_AND_RX_TDD || type == XTRX_TUNE_RX_FDD) &&
+			(dev->rx_run_a || dev->rx_run_b)) {
+		res = _xtrx_signal_event(dev, XTRX_RX_LO_CHANGED);
+		if (res)
+			return res;
+	}
+	if ((type == XTRX_TUNE_TX_AND_RX_TDD || type == XTRX_TUNE_TX_FDD) &&
+			(dev->tx_run_a || dev->tx_run_b)) {
+		res = _xtrx_signal_event(dev, XTRX_TX_LO_CHANGED);
+		if (res)
+			return res;
+	}
+
+	return 0;
 }
 
 int lms7nfe_fe_set_lna(struct xtrx_fe_obj* obj,
@@ -1553,14 +1369,17 @@ int lms7nfe_fe_set_lna(struct xtrx_fe_obj* obj,
 	case XTRX_RX_L_LB: band = RFE_LBL; tx = 0; break;
 	case XTRX_RX_W_LB: band = RFE_LBW; tx = 0; break;
 
+	case XTRX_TX_H: band = 1; tx = 1; break;
+	case XTRX_TX_W: band = 2; tx = 1; break;
 
-	case XTRX_TX_L: band = 1; tx = 1; break; // FIXME!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-	case XTRX_TX_W: band = 2; tx = 1; break; // FIXME!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
-	case XTRX_RX_AUTO: dev->rx_lna_auto = false; return _xtrx_signal_event(dev, XTRX_RX_LNA_CHANGED);
-	case XTRX_TX_AUTO: dev->tx_lna_auto = false; return _xtrx_signal_event(dev, XTRX_TX_LNA_CHANGED);
+	case XTRX_RX_AUTO: dev->rx_lna_auto = true; return _xtrx_signal_event(dev, XTRX_RX_LNA_CHANGED);
+	case XTRX_TX_AUTO: dev->tx_lna_auto = true; return _xtrx_signal_event(dev, XTRX_TX_LNA_CHANGED);
 	default: return -EINVAL;
 	}
+
+	res = lms7_mac_set(&dev->lms_state, ch);
+	if (res)
+		return res;
 
 	if (tx) {
 		dev->tx_lna_auto = false;
