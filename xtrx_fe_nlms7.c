@@ -426,6 +426,12 @@ int lms7nfe_dd_set_samplerate(struct xtrx_fe_obj* obj,
 	const int tx_gen = (tx_port == 1) ? lml1_use_mmcm : lml2_use_mmcm;
 	const int rx_gen = (rx_port == 2) ? lml2_use_mmcm : lml1_use_mmcm;
 
+	if (dev->refclock == 0 || dev->lms_state.fref == 0) {
+		XTRXLLS_LOG("LMSF", XTRXLL_ERROR, "%s: refclock is not set, can't set samplerate\n",
+		            xtrxll_get_name(dev->lldev));
+		return -EINVAL;
+	}
+
 	if (l2_pid == 0 && l1_pid == 0) {
 		XTRXLLS_LOG("LMSF", XTRXLL_ERROR, "%s: Incorrect FPGA port configuration HWID=%08x => TX=%d RX=%d\n",
 				   xtrxll_get_name(dev->lldev), hwid, tx_port, rx_port);
@@ -566,14 +572,12 @@ int lms7nfe_dd_set_samplerate(struct xtrx_fe_obj* obj,
 	dev->tx_host_inter = tx_host_inter;
 	dev->rx_host_decim = rx_host_decim;
 
-	dev->refclock = inrates->dac.refclk;
 	// 1. Set CGEN frequency
 	// --------------------------------------------------------------
 	for (unsigned j = 0; j < 40; j++) {
 		unsigned clkdiv = (dacdiv == 1) ? 0 :
 						  (dacdiv == 2) ? 1 :
 						  (dacdiv == 4) ? 2 : 3;
-		dev->lms_state.fref = dev->refclock;
 
 		res = lms7_cgen_tune_sync(&dev->lms_state,
 								  cgen_rate,
@@ -829,7 +833,7 @@ static unsigned _ulog(unsigned d)
 static enum lms7_mac_mode _corr_ch(enum lms7_mac_mode mode,
 								   unsigned flags)
 {
-	if (mode == LMS7_CH_AB && (flags & XTRX_RSP_SISO_MODE)) {
+	if (mode == LMS7_CH_AB && (flags & XTRX_RSP_SISO_MODE) && (!(flags & XTRX_RSP_SISO_SWITCH))) {
 		if (flags & XTRX_RSP_SWAP_AB) {
 			mode = LMS7_CH_B;
 		} else {
@@ -859,7 +863,8 @@ int lms7nfe_dd_configure(struct xtrx_nfe_lms7* dev,
 			return -EINVAL;
 		}
 		rx_lmschan = _corr_ch(rx_lmschan, params->rx.flags);
-		dev->maprx = lms7nfe_get_lml_portcfg(&params->rx, dev->rx_no_siso_map);
+		dev->chprx = params->rx;
+		dev->maprx = lms7nfe_get_lml_portcfg(&dev->chprx, dev->rx_no_siso_map);
 
 		rxafen_a = rx_lmschan != LMS7_CH_B;
 		rxafen_b = rx_lmschan != LMS7_CH_A;
@@ -869,7 +874,8 @@ int lms7nfe_dd_configure(struct xtrx_nfe_lms7* dev,
 			return -EINVAL;
 		}
 		tx_lmschan = _corr_ch(tx_lmschan, params->tx.flags);
-		dev->maptx = lms7nfe_get_lml_portcfg(&params->tx, dev->tx_no_siso_map);
+		dev->chptx = params->tx;
+		dev->maptx = lms7nfe_get_lml_portcfg(&dev->chptx, dev->tx_no_siso_map);
 
 		txafen_a = tx_lmschan != LMS7_CH_B;
 		txafen_b = tx_lmschan != LMS7_CH_A;
@@ -1080,7 +1086,6 @@ int lms7nfe_dd_set_modes(struct xtrx_fe_obj* obj,
 						const struct xtrx_dd_params *params)
 {
 	struct xtrx_nfe_lms7 *dev = (struct xtrx_nfe_lms7 *)obj;
-
 	switch (op) {
 	case XTRX_FEDD_CONFIGURE:
 		return lms7nfe_dd_configure(dev, params);
@@ -1191,6 +1196,9 @@ int lms7nfe_bb_set_badwidth(struct xtrx_fe_obj* obj,
 		if (dir == XTRX_TUNE_BB_RX) {
 			bparam_set_val(&dev->rx_bw[(j == LMS7_CH_A) ? 0 : 1], bw);
 
+//			res = lms7_rbb_set_ext(&dev->lms_state);
+#if 1
+
 			///////////////// FIXMEEEEEEEEEE!!!!!!!!!!!!!!!!!!!!!!!!
 			res = lms7_rbb_set_path(&dev->lms_state, RBB_LBF);
 			if (res)
@@ -1199,6 +1207,7 @@ int lms7nfe_bb_set_badwidth(struct xtrx_fe_obj* obj,
 			res = lms7_rbb_set_bandwidth(&dev->lms_state, bw);
 			if (actualbw)
 				*actualbw = bw;
+#endif
 		} else if (dir == XTRX_TUNE_BB_TX) {
 			bparam_set_val(&dev->tx_bw[(j == LMS7_CH_A) ? 0 : 1], bw);
 
@@ -1275,6 +1284,14 @@ int lms7nfe_set_gain(struct xtrx_fe_obj* obj,
 	return res;
 }
 
+int lms7nfe_fe_set_refclock(struct xtrx_fe_obj* obj,
+					   double refclock)
+{
+	struct xtrx_nfe_lms7 *dev = (struct xtrx_nfe_lms7 *)obj;
+	dev->refclock = dev->lms_state.fref = refclock;
+	return 0;
+}
+
 int lms7nfe_fe_set_freq(struct xtrx_fe_obj* obj,
 					   unsigned channel,
 					   unsigned type,
@@ -1285,6 +1302,11 @@ int lms7nfe_fe_set_freq(struct xtrx_fe_obj* obj,
 	double res_freq = 0;
 	bool rx;
 	struct xtrx_nfe_lms7 *dev = (struct xtrx_nfe_lms7 *)obj;
+
+	if (dev->refclock == 0 || dev->lms_state.fref == 0) {
+		XTRXLLS_LOG("LMSF", XTRXLL_ERROR, "%s: refclock is not set, can't tune\n", xtrxll_get_name(dev->lldev));
+		return -EINVAL;
+	}
 
 	switch (type) {
 	case XTRX_TUNE_RX_FDD:
@@ -1484,6 +1506,28 @@ int lms7nfe_set_reg(struct xtrx_fe_obj* obj,
 		dev->txant = val & 1;
 		return xtrxll_set_param(dev->lldev, XTRXLL_PARAM_SWITCH_TX_ANT, dev->txant);
 
+	case XTRX_FE_CUSTOM_0 + 2:
+		if (val) {
+			dev->chprx.flags |= XTRX_RSP_SWAP_AB;
+		} else {
+			dev->chprx.flags &= ~XTRX_RSP_SWAP_AB;
+		}
+		dev->maprx = lms7nfe_get_lml_portcfg(&dev->chprx, dev->rx_no_siso_map);
+		return lms7_lml_set_map(&dev->lms_state,
+								dev->rx_port_1 ? dev->maprx : dev->maptx,
+								dev->rx_port_1 ? dev->maptx : dev->maprx);
+
+	case XTRX_FE_CUSTOM_0 + 3:
+		if (val) {
+			dev->chptx.flags |= XTRX_RSP_SWAP_AB;
+		} else {
+			dev->chptx.flags &= ~XTRX_RSP_SWAP_AB;
+		}
+		dev->maptx = lms7nfe_get_lml_portcfg(&dev->chptx, dev->tx_no_siso_map);
+		return lms7_lml_set_map(&dev->lms_state,
+								dev->rx_port_1 ? dev->maprx : dev->maptx,
+								dev->rx_port_1 ? dev->maptx : dev->maprx);
+
 	default:
 		if (type >= XTRX_RFIC_REG_0 && type <= XTRX_RFIC_REG_0 + 65535)	{
 			uint32_t rd;
@@ -1510,6 +1554,7 @@ static const struct xtrx_fe_ops _lms7nfe_ops = {
 	lms7nfe_bb_set_badwidth,
 	lms7nfe_set_gain,
 
+	lms7nfe_fe_set_refclock,
 	lms7nfe_fe_set_freq,
 	lms7nfe_fe_set_lna,
 	lms7nfe_set_gain,

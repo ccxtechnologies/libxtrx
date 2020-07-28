@@ -52,8 +52,6 @@ else()
 	message(WARNING "Unknown system type is ${CMAKE_SYSTEM_NAME}")
 endif()
 
-option(LMS_FE_OLD "Use LIBLMS7002M as LMS Frontend" OFF)
-
 add_definitions(-Wall -g)
 
 set(XTRX_LIBRARY_DIR      lib${LIB_SUFFIX})
@@ -76,28 +74,23 @@ endif(CMAKE_COMPILER_IS_GNUCC)
 
 find_package(libxtrxdsp REQUIRED)
 find_package(libxtrxll REQUIRED)
+find_package(liblms7compact REQUIRED)
 
 include_directories(${LIBXTRXDSP_INCLUDE_DIRS})
 include_directories(${LIBXTRXLL_INCLUDE_DIRS})
+include_directories(${LIBLMS7COMPACT_INCLUDE_DIRS})
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
-
-if(LMS_FE_OLD)
-    find_package(libLMS7002M REQUIRED)
-    include_directories(${LIBLMS7002M_INCLUDE_DIRS})
-
-    set(LMS_FE_FILENAME "xtrx_fe_lms7.c")
-    set(LMS_FE_LIBRARY  ${LIBLMS7002M_LIBRARIES})
-else()
-    find_package(liblms7compact REQUIRED)
-    include_directories(${LIBLMS7COMPACT_INCLUDE_DIRS})
-
-    add_definitions(-DHAVE_LMS_NFE)
-    set(LMS_FE_FILENAME "xtrx_fe_nlms7.c" "xtrx_fe_octorx0.c")
-    set(LMS_FE_LIBRARY  ${LIBLMS7COMPACT_LIBRARIES})
-endif()
-
-add_library(xtrx SHARED xtrx.c xtrx_debug.c xtrx_fe.c ${LMS_FE_FILENAME})
-target_link_libraries(xtrx ${LIBXTRXLL_LIBRARIES} ${LIBXTRXDSP_LIBRARIES} ${LMS_FE_LIBRARY} m)
+add_library(xtrx SHARED
+	xtrx.c
+	xtrx_debug.c
+	xtrx_fe.c
+	xtrx_fe_nlms7.c
+	xtrx_fe_octorx0.c
+	xtrx_fe_octocal0.c
+	octo/adf4355.c
+	)
+target_link_libraries(xtrx ${LIBXTRXLL_LIBRARIES} ${LIBXTRXDSP_LIBRARIES} ${LIBLMS7COMPACT_LIBRARIES} m)
 
 set_target_properties(xtrx PROPERTIES VERSION ${LIBVER} SOVERSION ${MAJOR_VERSION})
 
@@ -153,7 +146,8 @@ set(CPACK_PACKAGE_CONTACT             "http://fairwaves.co/wp/contact-us/")
 set(CPACK_PACKAGE_VERSION             ${LIBVER}-${MAINT_VERSION})
 set(CPACK_DEBIAN_PACKAGE_DEPENDS      "libc6 (>= 2.17), libxtrxll (>= 0.0.1), libxtrxdsp (>= 0.0.1), liblms7002m (>= 0.0.1)")
 if(ENABLE_SOAPY)
-	set(CPACK_DEBIAN_PACKAGE_DEPENDS      "${CPACK_DEBIAN_PACKAGE_DEPENDS}, soapysdr (>= 0.5.2)")
+#	TODO: need a dependency for correct soapy version
+#	set(CPACK_DEBIAN_PACKAGE_DEPENDS      "${CPACK_DEBIAN_PACKAGE_DEPENDS}, soapysdr (>= 0.5.2)")
 endif(ENABLE_SOAPY)
 
 

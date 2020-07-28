@@ -120,6 +120,8 @@ struct xtrx_dev {
 
 	unsigned               gpio_cfg_funcs;
 	unsigned               gpio_cfg_dir;
+
+	master_ts              gtime_start;
 };
 
 static const char* _devname(struct xtrx_dev* dev)
@@ -605,6 +607,10 @@ int xtrx_set_ref_clk(struct xtrx_dev* dev, unsigned refclkhz, xtrx_clock_source_
 						   _devname(dev),
 							(dev->clock_source) ? "EXT" : "INT",
 							(int)dev->refclock, osc);
+				// Pass it down to the RF FE
+				res = dev->fe->ops->fe_set_refclock(dev->fe, dev->refclock);
+				if (res)
+					return res;
 				break;
 			}
 		}
@@ -636,6 +642,11 @@ int xtrx_set_ref_clk(struct xtrx_dev* dev, unsigned refclkhz, xtrx_clock_source_
 
 		dev[devnum].refclock = dev->refclock;
 		dev[devnum].refclock_checked = dev->refclock_checked;
+
+		// Pass it down to the RF FE
+		res = dev[devnum].fe->ops->fe_set_refclock(dev[devnum].fe, dev->refclock);
+		if (res)
+			return res;
 	}
 
 	XTRXLLS_LOG("XTRX", XTRXLL_DEBUG, "%s: Set RefClk to %d Hz %s\n",
@@ -735,6 +746,7 @@ int xtrx_tune_ex(struct xtrx_dev* dev, xtrx_tune_t type, xtrx_channel_t ch,
 	case XTRX_TUNE_RX_FDD:
 	case XTRX_TUNE_TX_FDD:
 	case XTRX_TUNE_TX_AND_RX_TDD:
+	case XTRX_TUNE_EXT_FE:
 		if (!dev->refclock_checked) {
 			res = xtrx_set_ref_clk(dev, 0, dev->clock_source);
 			if (res)
@@ -1031,7 +1043,7 @@ int xtrx_run_ex(struct xtrx_dev* dev, const xtrx_run_params_t* params)
 			if (res) {
 				goto failed_fe;
 			}
-			XTRXLLS_LOG("XTRX", XTRXLL_INFO, "%s: RX ititialized to %d bytes paket size\n",
+			XTRXLLS_LOG("XTRX", XTRXLL_INFO, "%s: RX initialized to %d bytes packet size\n",
 						_devname(&dev[devnum]), rx_bpkt_size);
 			dev[devnum].rxinit = 1;
 		}
@@ -1200,6 +1212,7 @@ int xtrx_run_ex(struct xtrx_dev* dev, const xtrx_run_params_t* params)
 		dev[devnum].tx_fefmt = tx_fe_fmt;
 	}
 
+	dev->gtime_start = ~0UL;
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	for (unsigned devnum = 0; devnum < dev->dev_max; devnum++) {
 		struct xtrxll_dmaop op;
@@ -1224,6 +1237,12 @@ int xtrx_run_ex(struct xtrx_dev* dev, const xtrx_run_params_t* params)
 			XTRXLLS_LOG("XTRX", XTRXLL_ERROR, "%s: Unable to start DMA err=%d\n",
 						_devname(&dev[devnum]), res);
 			goto fail_dma_start;
+		}
+
+		if (params->nflags & XTRX_RUN_GTIME) {
+			dev->gtime_start = params->gtime.sec * 1000000000UL + params->gtime.nsec;
+			XTRXLLS_LOG("XTRX", XTRXLL_ERROR, "%s: STIME=%ld\n",
+						_devname(&dev[devnum]), dev->gtime_start);
 		}
 	}
 
@@ -1566,6 +1585,9 @@ int xtrx_recv_sync_ex(struct xtrx_dev* mdev, xtrx_recv_ex_info_t* info)
 					_devname(mdev));
 		return -ENOSTR;
 	}
+	if ((info->flags & RCVEX_REPORT_GTIME) && (mdev->gtime_start == ~0UL)) {
+		return -EINVAL;
+	}
 
 	const int chan = 0;
 	/* One sample in all channels in bytes */
@@ -1586,6 +1608,7 @@ int xtrx_recv_sync_ex(struct xtrx_dev* mdev, xtrx_recv_ex_info_t* info)
 
 	const bool single_ch_streaming = (info->buffer_count == mdev->dev_max);
 
+	master_ts gstarttm = mdev->gtime_start;
 	info->out_samples = 0;
 	info->out_events = 0;
 
@@ -1655,6 +1678,10 @@ got_buffer:
 
 		if (user_processed == 0) {
 			info->out_first_sample = dev->rx_samples >> dev->rx_host_decim;
+			if (info->flags & RCVEX_REPORT_GTIME) {
+				info->out_first_sample = gstarttm +
+						info->out_first_sample * 1000000000UL / dev->refclock;
+			}
 		}
 /*
 		XTRXLLS_LOG("XTRX", (dev->rxbuf_ts + dev->rxbuf_processed_ts != dev->rx_samples) ? XTRXLL_WARNING : XTRXLL_DEBUG,
@@ -1700,6 +1727,10 @@ got_buffer:
 				dev->rx_samples = dev->rxbuf_ts + dev->rxbuf_processed_ts;
 				if (user_processed == 0) {
 					info->out_first_sample = dev->rx_samples >> dev->rx_host_decim;
+					if (info->flags & RCVEX_REPORT_GTIME) {
+						info->out_first_sample = gstarttm +
+								info->out_first_sample * 1000000000UL / dev->refclock;
+					}
 				} else {
 					/* Lost data in the middle of filling, no concatenation */
 					return 0;
@@ -1850,8 +1881,8 @@ got_buffer:
 static int _xtrx_val_set_int(struct xtrx_dev* dev, xtrx_direction_t dir,
 				 xtrx_channel_t chan, xtrx_val_t type, uint64_t val)
 {
-	if (type >= XTRX_RFIC_REG_0 && type <= XTRX_RFIC_REG_0 + 65535)	{
-		XTRXLLS_LOG("XTRX", XTRXLL_INFO, "%s: FE REG %x %x\n",
+	if (type >= XTRX_RFIC_REG_0 && type < XTRX_DEBUG_0)	{
+		XTRXLLS_LOG("XTRX", XTRXLL_INFO, "%s: FE REG %x %lx\n",
 					_devname(dev), type, val);
 		return dev->fe->ops->set_reg(dev->fe, chan, dir, type, val);
 	}
@@ -1902,7 +1933,7 @@ static int _xtrx_val_get_int(struct xtrx_dev* dev, xtrx_direction_t dir,
 {
 	int res, val;
 
-	if (type >= XTRX_RFIC_REG_0 && type <= XTRX_RFIC_REG_0 + 65535)	{
+	if (type >= XTRX_RFIC_REG_0 && type < XTRX_DEBUG_0)	{
 		return dev->fe->ops->get_reg(dev->fe, chan, dir, type, oval);
 	};
 
@@ -2012,13 +2043,14 @@ static int _xtrx_gpio_configure(struct xtrx_dev* dev,
 		dev->gpio_cfg_dir = 0;
 		for (unsigned i = 0; i < XTRX_GPIOS_TOTAL; i++) {
 			dev->gpio_cfg_funcs |= gfunc << (2 * i);
-			dev->gpio_cfg_dir |=  dir << (2 * i);
+			dev->gpio_cfg_dir |=  dir << (i);
 		}
 	} else {
 		unsigned msk = 0x3U << (2 * gpio_num);
+		unsigned msk_dir = 0x1U << (gpio_num);
 
 		dev->gpio_cfg_funcs = (~msk & dev->gpio_cfg_funcs) | (gfunc << (2 * gpio_num));
-		dev->gpio_cfg_dir = (~msk & dev->gpio_cfg_dir) | (dir << (2 * gpio_num));
+		dev->gpio_cfg_dir = (~msk_dir & dev->gpio_cfg_dir) | (dir << (gpio_num));
 	}
 
 	res = xtrxll_set_param(dev->lldev, XTRXLL_PARAM_GPIO_DIR, dev->gpio_cfg_dir);
@@ -2116,7 +2148,9 @@ XTRX_API int xtrx_gpio_in(struct xtrx_dev* dev, int devno, unsigned* in)
 }
 
 static int _xtrx_gtime_ctrl(struct xtrx_dev* dev,
-							bool external, unsigned isec)
+							bool external,
+							unsigned isec,
+							bool fwen)
 {
 	int res;
 	res = xtrxll_set_param(dev->lldev,
@@ -2132,7 +2166,8 @@ static int _xtrx_gtime_ctrl(struct xtrx_dev* dev,
 
 	res = xtrxll_set_param(dev->lldev,
 						   XTRXLL_PARAM_GTIME_CTRL,
-						   (external) ? XTRXLL_GTIME_EXT_PPSFW : XTRXLL_GTIME_INT_ISO);
+						   (external) ?
+						   ((fwen) ? XTRXLL_GTIME_EXT_PPSFW : XTRXLL_GTIME_EXT_PPS) : XTRXLL_GTIME_INT_ISO);
 	if (res)
 		return res;
 
@@ -2153,7 +2188,9 @@ static int _xtrx_gtime_ctrl(struct xtrx_dev* dev,
 	if (res)
 		return res;
 
-	res = xtrxll_set_param(dev->lldev, XTRXLL_PARAM_ISOPPS_SETTIME, isec);
+	res = xtrxll_set_param(dev->lldev,
+						   (fwen) ? XTRXLL_PARAM_ISOPPS_SETTIME : XTRXLL_PARAM_CURPPS_SETTIME,
+						   isec);
 	if (res)
 		return res;
 
@@ -2170,12 +2207,13 @@ static int _xtrx_gtime_op(struct xtrx_dev* dev,
 
 	switch (cmd) {
 	case XTRX_GTIME_ENABLE_INT: {
-		return _xtrx_gtime_ctrl(dev, false, in.sec);
+		return _xtrx_gtime_ctrl(dev, false, in.sec, true);
 	}
 	case XTRX_GTIME_ENABLE_INT_WEXT:
-	case XTRX_GTIME_ENABLE_INT_WEXTE: {
+	case XTRX_GTIME_ENABLE_INT_WEXTE:
+	case XTRX_GTIME_ENABLE_INT_WEXTENFW: {
 		res = _xtrx_gpio_configure(dev,
-								   cmd == XTRX_GTIME_ENABLE_INT_WEXTE ? XTRX_GPIO_EPPS_O : XTRX_GPIO_PPS_O,
+								   cmd != XTRX_GTIME_ENABLE_INT_WEXT ? XTRX_GPIO_EPPS_O : XTRX_GPIO_PPS_O,
 								   XTRX_GPIO_FUNC_PPS_O);
 		if (res)
 			return res;
@@ -2184,14 +2222,17 @@ static int _xtrx_gtime_op(struct xtrx_dev* dev,
 		if (res)
 			return res;
 
-		return _xtrx_gtime_ctrl(dev, true, in.sec);
+		return _xtrx_gtime_ctrl(dev, true, in.sec,
+								cmd != XTRX_GTIME_ENABLE_INT_WEXTENFW);
 	}
-	case XTRX_GTIME_ENABLE_EXT: {
+	case XTRX_GTIME_ENABLE_EXT:
+	case XTRX_GTIME_ENABLE_EXTNFW: {
 		res = _xtrx_gpio_configure(dev, XTRX_GPIO_PPS_I, XTRX_GPIO_FUNC_PPS_I);
 		if (res)
 			return res;
 
-		return _xtrx_gtime_ctrl(dev, true, in.sec);
+		return _xtrx_gtime_ctrl(dev, true, in.sec,
+								cmd != XTRX_GTIME_ENABLE_EXTNFW);
 	}
 	case XTRX_GTIME_DISABLE: {
 		res = xtrxll_set_param(dev->lldev,
@@ -2219,6 +2260,10 @@ static int _xtrx_gtime_op(struct xtrx_dev* dev,
 	}
 	case XTRX_GTIME_SET_GENSEC: {
 		res = xtrxll_set_param(dev->lldev, XTRXLL_PARAM_ISOPPS_SETTIME, in.sec);
+		break;
+	}
+	case XTRX_GTIME_SET_CURSEC: {
+		res = xtrxll_set_param(dev->lldev, XTRXLL_PARAM_CURPPS_SETTIME, in.sec);
 		break;
 	}
 	case XTRX_GTIME_GET_CUR: {
